@@ -151,8 +151,12 @@ input[type=time],input[type=date]{min-height:46px;-webkit-appearance:none;appear
 .wk-day .lbl{font-size:11px;font-weight:700;color:var(--muted)}
 .free{color:var(--good);font-weight:700;font-size:13px}
 .busy{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile{border:0;background:var(--surface2);border-radius:16px;padding:11px 10px;text-align:left;display:flex;flex-direction:column;gap:2px;min-width:0}
+.tile-v{font-size:16px;font-weight:800;letter-spacing:-.02em;margin-top:6px;white-space:nowrap}
+.tile-l{font-size:12px;font-weight:700}
 .hist{display:flex;align-items:center;gap:10px;padding:11px 2px;border-top:1px solid var(--line);width:100%;background:none;border-left:0;border-right:0;border-bottom:0;text-align:left}
 .hist:first-child{border-top:0}
+.hist:disabled{color:inherit;opacity:1;cursor:default}
 .hist .d{width:52px;flex:none;font-weight:700;font-size:13px;line-height:1.2}
 .hist .d small{display:block;color:var(--muted);font-weight:600;font-size:11px}
 .rec{border:1px solid var(--line);border-radius:14px;padding:12px;margin-bottom:8px;background:var(--surface)}
@@ -281,13 +285,13 @@ const SOURCES = [
 ];
 
 // ---------- sleep debt ----------
-// Short night = under max(7h, goal − 30 min). AASM/SRS: adults need 7+ h.
+// Short night = more than 15 min under your goal (goals start at 7 h: AASM/SRS).
 // Heads-up after 2 short nights in a row; warning when 3+ short nights in 7,
 // 2+ nights of ≤6 h, or ≥5 h total debt. (Van Dongen 2003: deficits build night
 // after night while you stop feeling it; Prather 2015: ≤6 h → 4.2× more colds.)
 function sleepStatus(m, checkins, today) {
   const by = byDay(checkins, m.id);
-  const target = Number(m.sleep_target) || 7.5, shortBelow = Math.max(7, target - 0.5);
+  const target = Number(m.sleep_target) || 7.5, shortBelow = target - 0.25;
   const nights = [...Array(7)].map((_, i) => { const d = addDays(today, -i); const v = by[d]?.sleep_hours; return { day: d, h: v == null ? null : Number(v) }; });
   const isShort = n => n.h != null && n.h < shortBelow;
   let streak = 0;
@@ -300,6 +304,37 @@ function sleepStatus(m, checkins, today) {
   const wake = median(wakes) ?? 360;
   const bedBy = fmtMin(wake - (target + (level === 2 ? 0.5 : 0)) * 60 - 15);
   return { target, shortBelow, nights: nights.reverse(), streak, shortCount, veryShort, debt, level, bedBy, known: known.length };
+}
+
+// ---------- pillar status (sleep / move / food) ----------
+const LV_COLOR = { good: 'var(--good)', warn: 'var(--warn)', bad: 'var(--bad)', none: 'var(--muted)' };
+function pillars(m, checkins, workouts, today) {
+  const by = byDay(checkins, m.id);
+  // sleep
+  const ss = sleepStatus(m, checkins, today);
+  const lastN = ss.nights[6].h != null ? ss.nights[6] : ss.nights[5];
+  const vals = ss.nights.filter(n => n.h != null).map(n => n.h), avgS = avg(vals);
+  const sl = !ss.known ? 'none' : ss.level === 2 ? 'bad' : (ss.level === 1 || (lastN.h != null && lastN.h < ss.shortBelow) || (avgS != null && avgS < ss.shortBelow)) ? 'warn' : 'good';
+  // move
+  const steps = [1, 2, 3, 4, 5, 6, 7].map(i => by[addDays(today, -i)]?.steps).filter(v => v != null);
+  const avgSt = steps.length ? Math.round(avg(steps)) : null;
+  const act = activeMin(workouts, m.id, addDays(today, -6), today), at = Number(m.activity_target || 150), stT = Number(m.steps_target || 8000);
+  const usesW = workouts.some(w => w.member_id === m.id);
+  const ratio = Math.max(usesW ? act / at : 0, avgSt != null ? avgSt / stT : 0);
+  const mv = (!usesW && avgSt == null) ? 'none' : ratio >= 0.9 ? 'good' : ratio >= 0.5 ? 'warn' : 'bad';
+  // food
+  const fd = [0, 1, 2, 3, 4, 5, 6].map(i => by[addDays(today, -i)]?.food_prev).filter(Boolean);
+  const goodN = fd.filter(f => f === 'good').length, badN = fd.filter(f => f === 'bad').length;
+  const fs = fd.length ? avg(fd.map(f => ({ good: 1, meh: 0.5, bad: 0 })[f])) : null;
+  const fl = !fd.length ? 'none' : (fs >= 0.75 && badN < 2) ? 'good' : fs >= 0.5 ? 'warn' : 'bad';
+  return {
+    sleep: { level: sl, label: { bad: 'Sleep debt', warn: 'Below goal', good: 'On track', none: 'No data' }[sl],
+      value: lastN.h != null ? hrs(lastN.h) : '–', sub: lastN.h != null ? `${ss.shortCount} short night${ss.shortCount === 1 ? '' : 's'}` : 'no check-in yet', ss },
+    move: { level: mv, label: { bad: 'Too little', warn: 'A bit low', good: 'Active', none: 'No data' }[mv],
+      value: `${act} min`, sub: `${avgSt != null ? num(avgSt) : '–'} steps/day`, act, at, avgSt, stT },
+    food: { level: fl, label: { bad: 'Poor week', warn: 'Could be better', good: 'Eating well', none: 'No data' }[fl],
+      value: fd.length ? `${goodN}/${fd.length}` : '–', sub: 'good days', goodN, badN, n: fd.length },
+  };
 }
 
 // ---------- health logic ----------
@@ -355,7 +390,7 @@ function scores(m, checkins, workouts, today) {
   const usesWorkouts = workouts.some(w => w.member_id === m.id);
   const sport = [st.length ? Math.min(1, avg(st) / Number(m.steps_target)) : null, usesWorkouts ? Math.min(1, act / Number(m.activity_target || 150)) : null].filter(v => v != null);
   return {
-    sleep: sl.length ? Math.min(1, avg(sl) / Number(m.sleep_target)) : null,
+    sleep: sl.length ? Math.max(0.05, Math.min(1, (avg(sl) - 5) / (Number(m.sleep_target) - 5))) : null,
     sport: sport.length ? avg(sport) : null,
     food: fd.length ? avg(fd) : null,
     avgSleep: avg(sl), avgSteps: st.length ? Math.round(avg(st)) : null, wake: median(wk), bed: median(bd), act,
@@ -512,37 +547,63 @@ function CheckIn({ ctx }) {
     ${partnerLine}</div>`;
 }
 
-// ---------- sleep card ----------
-function SleepCard({ ctx, m, title }) {
-  const st = sleepStatus(m, ctx.checkins, ctx.today);
-  const [why, setWhy] = useState(false);
-  const max = 10, H = 84;
-  return html`<div className="card">
-    <div className="card-title"><b>${title || 'Sleep this week'}</b>
-      <span className=${'pill ' + (st.level === 2 ? 'bad' : st.level === 1 ? 'warn' : 'good')}>${st.level === 2 ? 'Sleep debt' : st.level === 1 ? 'Watch out' : 'On track'}</span></div>
-    <div style=${{ position: 'relative', height: H + 22, marginTop: 10 }}>
-      <div style=${{ position: 'absolute', left: 0, right: 0, bottom: 22 + H * st.target / max, borderTop: '1.5px dashed var(--muted)', opacity: .5 }}></div>
-      <div style=${{ display: 'flex', gap: 8, alignItems: 'flex-end', height: '100%' }}>
-        ${st.nights.map(n => html`<div key=${n.day} style=${{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
-          <div style=${{ width: '100%', maxWidth: 30, height: n.h != null ? Math.max(4, H * Math.min(n.h, max) / max) : 4, borderRadius: 7,
-            background: n.h == null ? 'var(--surface2)' : n.h <= 6 ? 'var(--bad)' : n.h < st.shortBelow ? 'var(--warn)' : 'var(--good)' }}></div>
-          <span className="tiny muted" style=${{ fontWeight: 600 }}>${DOW[dow(n.day)].slice(0, 2)}</span></div>`)}
-      </div>
+// ---------- charts & cards ----------
+function Bars({ items, goal, max, H = 84 }) {
+  return html`<div style=${{ position: 'relative', height: H + 22, marginTop: 10 }}>
+    ${goal != null && html`<div style=${{ position: 'absolute', left: 0, right: 0, bottom: 22 + H * Math.min(goal, max) / max, borderTop: '1.5px dashed var(--muted)', opacity: .55 }}></div>`}
+    <div style=${{ display: 'flex', gap: 8, alignItems: 'flex-end', height: '100%' }}>
+      ${items.map(it => html`<div key=${it.key} style=${{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+        <div style=${{ width: '100%', maxWidth: 30, height: it.value != null ? Math.max(4, H * Math.min(it.value, max) / max) : 4, borderRadius: 7, background: it.value == null ? 'var(--surface2)' : it.color }}></div>
+        <span className="tiny muted" style=${{ fontWeight: 600 }}>${it.label}</span></div>`)}
     </div>
+  </div>`;
+}
+
+const LvPill = ({ lv, label }) => html`<span className=${'pill ' + (lv === 'none' ? '' : lv)}>${label}</span>`;
+
+function SleepCard({ ctx, m }) {
+  const pl = pillars(m, ctx.checkins, ctx.workouts, ctx.today), st = pl.sleep.ss;
+  const [why, setWhy] = useState(false);
+  return html`<div className="card">
+    <div className="card-title"><b>Sleep this week</b><${LvPill} lv=${pl.sleep.level} label=${pl.sleep.label} /></div>
+    <${Bars} goal=${st.target} max=${10} items=${st.nights.map(n => ({ key: n.day, label: DOW[dow(n.day)].slice(0, 2), value: n.h,
+      color: n.h == null ? '' : n.h <= 6 ? 'var(--bad)' : n.h < st.shortBelow ? 'var(--warn)' : 'var(--good)' }))} />
     <div className="stats" style=${{ marginTop: 12 }}>
       <div className="stat"><b>${st.shortCount}/${st.known || 0}</b><span>short nights</span></div>
-      <div className="stat"><b>${hrs(st.debt)}</b><span>sleep debt</span></div>
+      <div className="stat"><b>${hrs(st.debt)}</b><span>below goal</span></div>
       <div className="stat"><b>${st.bedBy}</b><span>in bed by</span></div>
     </div>
     <button className="link" style=${{ marginTop: 8, display: 'inline-flex', alignItems: 'center', gap: 4 }} onClick=${() => setWhy(!why)}><${Icon} n="info" s=${14} />How this works</button>
     ${why && html`<div className="guide">
-      A night counts as <b>short</b> under ${hrs(st.shortBelow)}. Dashed line = your ${hrs(st.target)} goal.<br />
-      <b>Heads-up</b> after 2 short nights in a row. <b>Sleep debt</b> warning after 3 short nights in a week, 2 nights of 6 h or less, or 5 h total below goal.
+      <b>Green</b> = goal met, <b>yellow</b> = short (15+ min under your ${hrs(st.target)} goal), <b>red</b> = 6 h or less. Dashed line = goal.<br />
+      <b>Below goal</b> as soon as last night or your weekly average is short. <b>Sleep debt</b> after 3 short nights in a week, 2 nights of 6 h or less, or 5 h total below goal.
       <ul>
         <li>Two weeks of 6-hour nights impair focus as much as a full night without sleep, and people stop noticing it (Van Dongen 2003).</li>
         <li>Sleeping 6 h or less makes you about 4× more likely to catch a cold (Prather 2015).</li>
-        <li>"In bed by" = your usual wake-up time minus your goal and 15 min to fall asleep${st.level === 2 ? ', plus 30 min extra to pay back debt' : ''}.</li>
+        <li>"In bed by" = usual wake-up time minus your goal and 15 min to fall asleep${st.level === 2 ? ', plus 30 min to pay back debt' : ''}.</li>
       </ul>
+    </div>`}
+  </div>`;
+}
+
+function Balance({ ctx, go }) {
+  const p = pillars(ctx.me, ctx.checkins, ctx.workouts, ctx.today);
+  const pp = ctx.partner && pillars(ctx.partner, ctx.checkins, ctx.workouts, ctx.today);
+  const T = [['sleep', 'bed', 'Sleep'], ['move', 'activity', 'Move'], ['food', 'food', 'Food']];
+  return html`<div className="card">
+    <div className="card-title"><b>Your week</b><span className="tiny muted">tap for details</span></div>
+    <div className="stats" style=${{ marginTop: 10 }}>
+      ${T.map(([k, ic, l]) => html`<button key=${k} className="tile" onClick=${() => go('health', k)}>
+        <div className="row between"><span className="row" style=${{ gap: 5, fontWeight: 700, fontSize: 13 }}><${Icon} n=${ic} s=${15} />${l}</span>
+          <i style=${{ width: 9, height: 9, borderRadius: 9, background: LV_COLOR[p[k].level] }}></i></div>
+        <div className="tile-v">${p[k].value}</div>
+        <div className="tile-l" style=${{ color: LV_COLOR[p[k].level] }}>${p[k].label}</div>
+        <div className="tiny muted">${p[k].sub}</div>
+      </button>`)}
+    </div>
+    ${pp && html`<div className="row small muted" style=${{ marginTop: 12, gap: 8, flexWrap: 'wrap' }}>
+      <${Face} color=${ctx.colorOf(ctx.partner.id)} size=${18} /><span style=${{ fontWeight: 600 }}>${ctx.partner.name}</span>
+      ${T.map(([k, , l]) => html`<span key=${k} className="row" style=${{ gap: 5 }}><i style=${{ width: 8, height: 8, borderRadius: 9, background: LV_COLOR[pp[k].level] }}></i>${l}</span>`)}
     </div>`}
   </div>`;
 }
@@ -821,58 +882,165 @@ function EditDay({ ctx, member, day, close }) {
   <//>`;
 }
 
-function Health({ ctx }) {
-  const { members, checkins, workouts, today, me } = ctx;
-  const [who, setWho] = useState(me.id); const [edit, setEdit] = useState(null);
-  const series = members.map((m, i) => ({ name: m.name, color: COLORS[i % 2], soft: SOFTS[i % 2], s: scores(m, checkins, workouts, today), m }));
-  const sel = members.find(m => m.id === who) || me;
-  const by = byDay(checkins, sel.id);
-  const days = [...Array(14)].map((_, i) => addDays(today, -i));
-  const insights = members.map(m => sickInsight(m, checkins)).filter(Boolean);
+function EditFood({ ctx, day, close }) {
+  const row = ctx.checkins.find(c => c.member_id === ctx.me.id && c.day === day) || {};
+  const [v, setV] = useState(row.food_prev || null);
+  const save = async () => {
+    const { error } = await sb.from('checkins').upsert({ member_id: ctx.me.id, day, food_prev: v, updated_at: new Date().toISOString() }, { onConflict: 'member_id,day' });
+    if (error) return alert(error.message); ctx.reload(); close();
+  };
+  return html`<${Sheet} close=${close}>
+    <h3>Food · ${fmtLong(addDays(day, -1))}</h3><div style=${{ height: 10 }}></div>
+    <${FoodPicker} value=${v} onPick=${setV} />
+    <div style=${{ height: 16 }}></div><button className="btn" onClick=${save}>Save</button>
+  <//>`;
+}
+
+const LAST14 = today => [...Array(14)].map((_, i) => addDays(today, -i));
+
+function SleepSection({ ctx, m, mine }) {
+  const [edit, setEdit] = useState(null);
+  const by = byDay(ctx.checkins, m.id), st = sleepStatus(m, ctx.checkins, ctx.today);
+  const s = scores(m, ctx.checkins, ctx.workouts, ctx.today);
+  const wakes = LAST14(ctx.today).map(d => toMin(by[d]?.wake_time)).filter(v => v != null);
+  const spread = wakes.length >= 3 ? Math.round(median(wakes.map(w => Math.abs(w - median(wakes))))) : null;
   return html`<div>
-    <${Header} ctx=${ctx} title="Health" sub="Sleep · Move · Food" />
+    <${SleepCard} ctx=${ctx} m=${m} />
     <div className="card">
-      <${Triangle} series=${series} />
-      <div className="row" style=${{ justifyContent: 'center', gap: 16, marginTop: 2 }}>
-        ${series.map(s => html`<span key=${s.name} className="row small" style=${{ gap: 6, fontWeight: 600 }}><${Face} color=${s.color} size=${18} />${s.name}</span>`)}</div>
-      <p className="tiny muted" style=${{ textAlign: 'center', marginBottom: 0 }}>Last 7 days compared with your goals. A fuller triangle means a better balance.</p>
-    </div>
-    ${series.map(({ m, s, color }) => html`<div key=${m.id} className="card">
-      <div className="row" style=${{ gap: 8, marginBottom: 12 }}><${Face} color=${color} size=${24} /><b>${m.name}</b><span className="tiny muted">· 7-day average</span></div>
-      <div className="stats">
+      <div className="card-title"><b>Rhythm</b><span className="tiny muted">7-day average</span></div>
+      <div className="stats" style=${{ marginTop: 10 }}>
         <div className="stat"><b>${hrs(s.avgSleep)}</b><span>sleep</span></div>
         <div className="stat"><b>${s.bed != null ? fmtMin(s.bed) : '–'}</b><span>usual bedtime</span></div>
         <div className="stat"><b>${s.wake != null ? fmtMin(s.wake) : '–'}</b><span>usual wake</span></div>
-        <div className="stat"><b>${num(s.avgSteps)}</b><span>steps/day</span></div>
-        <div className="stat"><b>${s.act}</b><span>active min</span></div>
-        <div className="stat"><b>${s.food != null ? Math.round(s.food * 100) + '%' : '–'}</b><span>good food</span></div>
-      </div></div>`)}
-    <${Sec} title="Sleep" />
-    ${members.map(m => html`<${SleepCard} key=${m.id} ctx=${ctx} m=${m} title=${m.name} />`)}
-    ${insights.length > 0 && html`<${Sec} title="Sick pattern" />${insights.map((t, i) => html`<div key=${i} className="alert soft"><${Icon} n="sparkle" s=${17} />${t}</div>`)}`}
-    <${Sec} title="Last 14 days" />
-    ${members.length > 1 && html`<${Seg} options=${members.map(m => [m.id, m.name])} value=${who} onPick=${setWho} />`}
+      </div>
+      <p className="tiny muted" style=${{ marginBottom: 0 }}>${spread != null ? `Wake-up time varies by about ±${spread} min. ${spread <= 30 ? 'Nice and regular.' : 'Try to keep it within 30 min, even on weekends.'}` : 'A regular wake-up time matters as much as the hours you sleep.'}</p>
+    </div>
+    <${Sec} title="Last 14 nights" />
     <div className="card" style=${{ padding: '4px 14px' }}>
-      ${days.map(d => { const c = by[d] || {}; const ws = workouts.filter(w => w.member_id === sel.id && w.day === d); const am = ws.reduce((x, w) => x + w.minutes, 0);
-        return html`<button key=${d} className="hist" disabled=${sel.id !== me.id} onClick=${() => setEdit(d)}>
+      ${LAST14(ctx.today).map(d => { const c = by[d] || {}; const h = c.sleep_hours != null ? Number(c.sleep_hours) : null;
+        return html`<button key=${d} className="hist" disabled=${!mine} onClick=${() => setEdit(d)}>
           <div className="d">${DOW[dow(d)]}<small>${fmtShort(d)}</small></div>
-          <div className="grow small">
-            <div style=${{ fontWeight: 600 }}>${c.bed_time || c.wake_time ? `${t5(c.bed_time) || '?'} → ${t5(c.wake_time) || '?'}` : '–'}${c.sleep_hours != null ? html` <span className="muted">· ${hrs(Number(c.sleep_hours))}</span>` : ''}</div>
-            <div className="tiny muted">${num(c.steps)} steps${am ? ` · ${am} min workout` : ''}</div>
-          </div>
-          ${c.feeling && html`<span title=${FEEL[c.feeling][1]} style=${{ color: c.feeling === 'sick' ? 'var(--bad)' : c.feeling === 'good' ? 'var(--good)' : 'var(--warn)' }}><${Icon} n=${FEEL[c.feeling][0]} s=${19} /></span>`}
-          ${c.food_prev && html`<span title=${'Food ' + FOOD[c.food_prev][1]} style=${{ color: c.food_prev === 'bad' ? 'var(--bad)' : c.food_prev === 'good' ? 'var(--good)' : 'var(--warn)' }}><${Icon} n="food" s=${17} /></span>`}
+          <div className="grow small" style=${{ fontWeight: 600 }}>${c.bed_time || c.wake_time ? `${t5(c.bed_time) || '?'} → ${t5(c.wake_time) || '?'}` : html`<span className="muted">–</span>`}</div>
+          ${h != null && html`<span className=${'pill ' + (h <= 6 ? 'bad' : h < st.shortBelow ? 'warn' : 'good')}>${hrs(h)}</span>`}
         </button>`; })}
     </div>
-    ${sel.id === me.id && html`<p className="tiny muted" style=${{ textAlign: 'center' }}>Tap a day to fill in or fix it.</p>`}
-    ${edit && html`<${EditDay} ctx=${ctx} member=${me} day=${edit} close=${() => setEdit(null)} />`}
+    ${mine && html`<p className="tiny muted" style=${{ textAlign: 'center' }}>Tap a night to fill in or fix it.</p>`}
+    ${edit && html`<${EditDay} ctx=${ctx} member=${m} day=${edit} close=${() => setEdit(null)} />`}
+  </div>`;
+}
+
+function MoveSection({ ctx, m, mine }) {
+  const [steps, setSteps] = useState(null); const [adding, setAdding] = useState(false);
+  const by = byDay(ctx.checkins, m.id), p = pillars(m, ctx.checkins, ctx.workouts, ctx.today).move;
+  const days7 = [...Array(7)].map((_, i) => addDays(ctx.today, i - 6));
+  const del = async w => { await sb.from('workouts').delete().eq('id', w.id); ctx.reload(); };
+  return html`<div>
+    <div className="card">
+      <div className="card-title"><b>Move this week</b><${LvPill} lv=${p.level} label=${p.label} /></div>
+      <div className="row between small" style=${{ marginTop: 12 }}><span className="muted">Active minutes (vigorous ×2)</span><b>${p.act} / ${p.at}</b></div>
+      <div className="bar" style=${{ marginTop: 6 }}><i style=${{ width: `${Math.min(100, p.act / p.at * 100)}%`, background: 'var(--p2)' }}></i></div>
+      <div className="small muted" style=${{ marginTop: 16, fontWeight: 600 }}>Steps · goal ${num(p.stT)}</div>
+      <${Bars} goal=${p.stT} max=${Math.max(p.stT * 1.5, ...days7.map(d => by[d]?.steps || 0))} items=${days7.map(d => { const v = by[d]?.steps; return { key: d, label: DOW[dow(d)].slice(0, 2), value: v ?? null,
+        color: v == null ? '' : v >= p.stT ? 'var(--good)' : v >= p.stT * 0.6 ? 'var(--warn)' : 'var(--bad)' }; })} />
+      <p className="tiny muted" style=${{ marginBottom: mine ? 12 : 0 }}>WHO: 150–300 active minutes a week. Steps: most of the benefit comes by ~7,000–8,000 a day.</p>
+      ${mine && html`<button className="btn" onClick=${() => setAdding(true)}><${Icon} n="plus" s=${18} w=${2.4} />Log workout</button>`}
+    </div>
+    <${Sec} title="Last 14 days" />
+    <div className="card" style=${{ padding: '4px 14px' }}>
+      ${LAST14(ctx.today).map(d => { const c = by[d] || {}; const ws = ctx.workouts.filter(w => w.member_id === m.id && w.day === d);
+        return html`<div key=${d} className="hist" style=${{ alignItems: 'flex-start' }}>
+          <div className="d">${DOW[dow(d)]}<small>${fmtShort(d)}</small></div>
+          <div className="grow small">
+            <button disabled=${!mine} onClick=${() => setSteps(d)} style=${{ background: 'none', border: 0, padding: 0, fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <${Icon} n="steps" s=${14} />${c.steps != null ? num(c.steps) + ' steps' : html`<span className="muted">no steps</span>`}${mine && html`<${Icon} n="pencil" s=${12} style=${{ color: 'var(--muted)' }} />`}</button>
+            ${ws.map(w => html`<div key=${w.id} className="row" style=${{ gap: 6, marginTop: 4 }}><${Icon} n="activity" s=${14} />
+              <span>${w.kind} · ${w.minutes} min${w.intensity === 'vigorous' ? ' · vigorous' : ''}</span>
+              ${mine && html`<button className="x" style=${{ padding: 2 }} aria-label="Delete" onClick=${() => del(w)}><${Icon} n="x" s=${14} /></button>`}</div>`)}
+          </div>
+        </div>`; })}
+    </div>
+    ${steps && html`<${EditSteps} ctx=${ctx} day=${steps} value=${by[steps]?.steps} close=${() => setSteps(null)} />`}
+    ${adding && html`<${AddWorkout} ctx=${ctx} close=${() => setAdding(false)} />`}
+  </div>`;
+}
+
+function FoodSection({ ctx, m, mine }) {
+  const [edit, setEdit] = useState(null); const [info, setInfo] = useState(false);
+  const by = byDay(ctx.checkins, m.id), p = pillars(m, ctx.checkins, ctx.workouts, ctx.today).food;
+  const days7 = [...Array(7)].map((_, i) => addDays(ctx.today, i - 6));
+  const col = f => f === 'good' ? 'var(--good)' : f === 'meh' ? 'var(--warn)' : f === 'bad' ? 'var(--bad)' : 'var(--surface2)';
+  return html`<div>
+    <div className="card">
+      <div className="card-title"><b>Food this week</b><${LvPill} lv=${p.level} label=${p.label} /></div>
+      <div className="row" style=${{ justifyContent: 'space-between', marginTop: 14 }}>
+        ${days7.map(d => { const f = by[d]?.food_prev; return html`<div key=${d} style=${{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 5 }}>
+          <span style=${{ width: 36, height: 36, borderRadius: 12, display: 'grid', placeItems: 'center', background: col(f), color: f ? '#fff' : 'var(--muted)' }}>${f ? html`<${Icon} n=${FOOD[f][0]} s=${18} w=${2.2} />` : '·'}</span>
+          <span className="tiny muted" style=${{ fontWeight: 600 }}>${DOW[dow(addDays(d, -1))].slice(0, 2)}</span></div>`; })}
+      </div>
+      <div className="stats" style=${{ marginTop: 14 }}>
+        <div className="stat"><b style=${{ color: 'var(--good)' }}>${p.goodN}</b><span>good days</span></div>
+        <div className="stat"><b style=${{ color: 'var(--warn)' }}>${p.n - p.goodN - p.badN}</b><span>okay days</span></div>
+        <div className="stat"><b style=${{ color: 'var(--bad)' }}>${p.badN}</b><span>poor days</span></div>
+      </div>
+      <button className="link" style=${{ marginTop: 8, display: 'inline-flex', alignItems: 'center', gap: 4 }} onClick=${() => setInfo(!info)}><${Icon} n="info" s=${14} />What counts as eating well?</button>
+      ${info && html`<div className="guide">
+        ${Object.entries(FOOD).map(([k, [ic, l, d]]) => html`<div key=${k} style=${{ marginBottom: 6 }}><b>${l}:</b> ${d}</div>`)}
+        <ul><li>Sugar max 50 g ≈ 4 tbsp a day</li><li>Salt max 5 g ≈ 1 tsp a day</li><li>Oil/fat max 67 g ≈ 5 tbsp a day</li><li>Isi Piringku: half the plate veg & fruit</li></ul>
+      </div>`}
+    </div>
+    <${Sec} title="Last 14 days" />
+    <div className="card" style=${{ padding: '4px 14px' }}>
+      ${LAST14(ctx.today).slice(0, 14).map(d => { const f = by[d]?.food_prev; const eaten = addDays(d, -1);
+        return html`<button key=${d} className="hist" disabled=${!mine} onClick=${() => setEdit(d)}>
+          <div className="d">${DOW[dow(eaten)]}<small>${fmtShort(eaten)}</small></div>
+          <div className="grow"></div>
+          ${f ? html`<span className=${'pill ' + (f === 'good' ? 'good' : f === 'meh' ? 'warn' : 'bad')}><${Icon} n=${FOOD[f][0]} s=${13} />${FOOD[f][1]}</span>` : html`<span className="tiny muted">–</span>`}
+        </button>`; })}
+    </div>
+    ${edit && html`<${EditFood} ctx=${ctx} day=${edit} close=${() => setEdit(null)} />`}
+  </div>`;
+}
+
+function Health({ ctx }) {
+  const { members, checkins, workouts, today, me } = ctx;
+  const sec = ctx.hsec, setSec = ctx.setHsec;
+  const [who, setWho] = useState(me.id);
+  const sel = members.find(m => m.id === who) || me;
+  const series = members.map((m, i) => ({ name: m.name, color: COLORS[i % 2], soft: SOFTS[i % 2], s: scores(m, checkins, workouts, today), m }));
+  const insights = members.map(m => sickInsight(m, checkins)).filter(Boolean);
+  const T = [['sleep', 'bed', 'Sleep'], ['move', 'activity', 'Move'], ['food', 'food', 'Food']];
+  return html`<div>
+    <${Header} ctx=${ctx} title="Health" sub="Sleep · Move · Food" />
+    <${Seg} options=${[['overview', 'Overview'], ['sleep', 'Sleep'], ['move', 'Move'], ['food', 'Food']]} value=${sec} onPick=${setSec} />
+    ${sec === 'overview' ? html`<div>
+      <div className="card">
+        <${Triangle} series=${series} />
+        <div className="row" style=${{ justifyContent: 'center', gap: 16, marginTop: 2 }}>
+          ${series.map(s => html`<span key=${s.name} className="row small" style=${{ gap: 6, fontWeight: 600 }}><${Face} color=${s.color} size=${18} />${s.name}</span>`)}</div>
+        <p className="tiny muted" style=${{ textAlign: 'center', marginBottom: 0 }}>Last 7 days compared with each person's goals. A fuller triangle means a better balance.</p>
+      </div>
+      ${members.map((m, i) => { const p = pillars(m, checkins, workouts, today); return html`<div key=${m.id} className="card">
+        <div className="row" style=${{ gap: 8, marginBottom: 10 }}><${Face} color=${COLORS[i % 2]} size=${24} /><b>${m.name}</b></div>
+        ${T.map(([k, ic, l]) => html`<button key=${k} className="hist" onClick=${() => { setWho(m.id); setSec(k); }}>
+          <span className="kind" style=${{ background: 'var(--surface2)' }}><${Icon} n=${ic} s=${17} /></span>
+          <div className="grow"><div style=${{ fontWeight: 700 }}>${l} · ${p[k].value}</div><div className="tiny muted">${p[k].sub}</div></div>
+          <${LvPill} lv=${p[k].level} label=${p[k].label} /><${Icon} n="right" s=${16} style=${{ color: 'var(--muted)' }} />
+        </button>`)}
+      </div>`; })}
+      ${insights.length > 0 && html`<${Sec} title="Sick pattern" />${insights.map((t, i) => html`<div key=${i} className="alert soft"><${Icon} n="sparkle" s=${17} />${t}</div>`)}`}
+    </div>` : html`<div>
+      ${members.length > 1 && html`<div className="chips" style=${{ marginBottom: 12 }}>${members.map((m, i) => html`<button key=${m.id} className=${'chip' + (who === m.id ? ' on' : '')} onClick=${() => setWho(m.id)}><${Face} color=${COLORS[i % 2]} size=${18} />${m.name}</button>`)}</div>`}
+      ${sec === 'sleep' ? html`<${SleepSection} key=${sel.id} ctx=${ctx} m=${sel} mine=${sel.id === me.id} />`
+        : sec === 'move' ? html`<${MoveSection} key=${sel.id} ctx=${ctx} m=${sel} mine=${sel.id === me.id} />`
+        : html`<${FoodSection} key=${sel.id} ctx=${ctx} m=${sel} mine=${sel.id === me.id} />`}
+    </div>`}
   </div>`;
 }
 
 // ---------- settings ----------
 function Settings({ ctx, close }) {
   const { me } = ctx;
-  const [name, setName] = useState(me.name);
+  const [names, setNames] = useState(Object.fromEntries(ctx.members.map(m => [m.id, m.name])));
   const [by, setBy] = useState(me.birth_year ? String(me.birth_year) : '');
   const [sleep, setSleep] = useState(String(me.sleep_target));
   const [act, setAct] = useState(String(me.activity_target ?? 150));
@@ -883,17 +1051,27 @@ function Settings({ ctx, close }) {
   const apply = () => { setSleep(String(rec.sleep.target)); setAct(String(rec.act.target)); setSteps(String(rec.steps.target)); };
   const save = async () => {
     const { error } = await sb.from('members').update({
-      name: name.trim() || me.name, birth_year: by ? parseInt(by) : null,
+      name: (names[me.id] || '').trim() || me.name, birth_year: by ? parseInt(by) : null,
       sleep_target: Number(sleep) || 7.5, activity_target: parseInt(act) || 150, steps_target: parseInt(steps) || 8000,
     }).eq('id', me.id);
-    if (error) return alert(error.message); ctx.reload(); close();
+    if (error) return alert(error.message);
+    for (const m of ctx.members) {
+      const n = (names[m.id] || '').trim();
+      if (m.id !== me.id && n && n !== m.name) { const r = await sb.from('members').update({ name: n }).eq('id', m.id); if (r.error) return alert(r.error.message); }
+    }
+    ctx.reload(); close();
   };
   const copy = async () => { try { await navigator.clipboard.writeText(me.ingest_token); setCopied(true); } catch { prompt('Copy this token:', me.ingest_token); } };
   return html`<${Sheet} close=${close}>
     <div className="row" style=${{ gap: 10 }}><${Face} color=${ctx.colorOf(me.id)} size=${30} /><h3>Settings</h3></div>
 
-    <div className="q">Name</div><input value=${name} onChange=${e => setName(e.target.value)} />
-    <div className="q">Birth year</div><input type="number" inputMode="numeric" placeholder="e.g. 1992" value=${by} onChange=${e => setBy(e.target.value)} />
+    <div className="q">Family names</div>
+    ${ctx.members.map((m, i) => html`<div key=${m.id} className="row" style=${{ marginBottom: 8 }}>
+      <${Face} color=${COLORS[i % 2]} size=${26} />
+      <input value=${names[m.id] || ''} placeholder="Name" onChange=${e => setNames({ ...names, [m.id]: e.target.value })} />
+    </div>`)}
+    <div className="q">Your birth year</div>
+    <input type="number" inputMode="numeric" placeholder="e.g. 1992" value=${by} onChange=${e => setBy(e.target.value)} />
 
     <div className="q" style=${{ marginTop: 24 }}><${Icon} n="sparkle" s=${17} />Recommended for you${age ? ` (age ${age})` : ''}</div>
     ${rec ? html`
@@ -946,7 +1124,7 @@ function Home({ ctx, go }) {
   return html`<div>
     <${Header} ctx=${ctx} logo=${true} title=${`${greet}, ${me.name}`} sub=${fmtLong(today)} />
     <${CheckIn} ctx=${ctx} />
-    <${SleepCard} ctx=${ctx} m=${me} />
+    <${Balance} ctx=${ctx} go=${go} />
     <${Sec} title="Heads-up" />
     ${alerts.length ? alerts.map((a, i) => html`<div key=${i} className=${'alert ' + a.level}><${Icon} n=${a.icon} s=${18} /><span>${a.text}</span></div>`)
       : html`<div className="alert ok"><${Icon} n="leaf" s=${18} /><span>All good. No warning signs right now.</span></div>`}
@@ -969,6 +1147,8 @@ function Main({ email, theme, setTheme }) {
   const [tab, setTab] = useState('home');
   const [uid, setUid] = useState(getLS(ME_KEY));
   const [settings, setSettings] = useState(false);
+  const [hsec, setHsec] = useState('overview');
+  const go = (t, sec) => { if (sec) setHsec(sec); setTab(t); window.scrollTo(0, 0); };
   const [data, setData] = useState(null); const [err, setErr] = useState('');
   const load = useCallback(async () => {
     const t = ymd();
@@ -997,14 +1177,14 @@ function Main({ email, theme, setTheme }) {
   const me = data.members.find(m => m.id === uid);
   if (!me) return html`<${PickMe} members=${data.members} onPick=${id => { setLS(ME_KEY, id); setUid(id); }} />`;
   const partner = data.members.find(m => m.id !== uid);
-  const ctx = { ...data, me, partner, uid, reload: load, theme, setTheme, openSettings: () => setSettings(true),
+  const ctx = { ...data, me, partner, uid, reload: load, theme, setTheme, hsec, setHsec, openSettings: () => setSettings(true),
     switchMe: () => { setLS(ME_KEY, null); setUid(null); },
     memberName: id => data.members.find(m => m.id === id)?.name || '?',
     colorOf: id => COLORS[Math.max(0, data.members.findIndex(m => m.id === id)) % 2] };
   const mineOpen = data.requests.filter(r => !r.done_at && (r.assignee === uid || r.assignee == null)).length;
   const TABS = [['home', 'home', 'Home'], ['req', 'list', 'Requests'], ['cal', 'cal', 'Calendar'], ['health', 'heart', 'Health']];
   return html`<div className="app"><main className="pad">
-      ${tab === 'home' ? html`<${Home} ctx=${ctx} go=${setTab} />` : tab === 'req' ? html`<${Requests} ctx=${ctx} />` : tab === 'cal' ? html`<${Calendar} ctx=${ctx} />` : html`<${Health} ctx=${ctx} />`}
+      ${tab === 'home' ? html`<${Home} ctx=${ctx} go=${go} />` : tab === 'req' ? html`<${Requests} ctx=${ctx} />` : tab === 'cal' ? html`<${Calendar} ctx=${ctx} />` : html`<${Health} ctx=${ctx} />`}
     </main>
     <nav className="tabs">${TABS.map(([k, ic, l]) => html`<button key=${k} className=${tab === k ? 'on' : ''} onClick=${() => { setTab(k); window.scrollTo(0, 0); }}>
       <span className="bub"><${Icon} n=${ic} s=${22} w=${tab === k ? 2.2 : 1.8} /></span>${l}${k === 'req' && mineOpen > 0 ? html`<span className="badge">${mineOpen}</span>` : null}</button>`)}</nav>
