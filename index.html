@@ -318,10 +318,10 @@ function pillars(m, checkins, workouts, today) {
   // move
   const steps = [1, 2, 3, 4, 5, 6, 7].map(i => by[addDays(today, -i)]?.steps).filter(v => v != null);
   const avgSt = steps.length ? Math.round(avg(steps)) : null;
-  const act = activeMin(workouts, m.id, addDays(today, -6), today), at = Number(m.activity_target || 150), stT = Number(m.steps_target || 8000);
-  const usesW = workouts.some(w => w.member_id === m.id);
-  const ratio = Math.max(usesW ? act / at : 0, avgSt != null ? avgSt / stT : 0);
-  const mv = (!usesW && avgSt == null) ? 'none' : ratio >= 0.9 ? 'good' : ratio >= 0.5 ? 'warn' : 'bad';
+  const sp = activeSplit(checkins, workouts, m.id, addDays(today, -6), today);
+  const act = sp.w + sp.s, at = Number(m.activity_target || 150);
+  const ratio = act / at;
+  const mv = !sp.has ? 'none' : ratio >= 0.9 ? 'good' : ratio >= 0.5 ? 'warn' : 'bad';
   // food
   const fd = [0, 1, 2, 3, 4, 5, 6].map(i => by[addDays(today, -i)]?.food_prev).filter(Boolean);
   const goodN = fd.filter(f => f === 'good').length, badN = fd.filter(f => f === 'bad').length;
@@ -331,7 +331,7 @@ function pillars(m, checkins, workouts, today) {
     sleep: { level: sl, label: { bad: 'Sleep debt', warn: 'Below goal', good: 'On track', none: 'No data' }[sl],
       value: lastN.h != null ? hrs(lastN.h) : '–', sub: lastN.h != null ? `${ss.shortCount} short night${ss.shortCount === 1 ? '' : 's'}` : 'no check-in yet', ss },
     move: { level: mv, label: { bad: 'Too little', warn: 'A bit low', good: 'Active', none: 'No data' }[mv],
-      value: `${act} min`, sub: `${avgSt != null ? num(avgSt) : '–'} steps/day`, act, at, avgSt, stT },
+      value: `${act} min`, sub: `of ${at} this week`, act, at, avgSt, fromSteps: sp.s, fromWorkouts: sp.w },
     food: { level: fl, label: { bad: 'Poor week', warn: 'Could be better', good: 'Eating well', none: 'No data' }[fl],
       value: fd.length ? `${goodN}/${fd.length}` : '–', sub: 'good days', goodN, badN, n: fd.length },
   };
@@ -339,7 +339,24 @@ function pillars(m, checkins, workouts, today) {
 
 // ---------- health logic ----------
 const byDay = (rows, id) => Object.fromEntries(rows.filter(c => c.member_id === id).map(c => [c.day, c]));
-const activeMin = (workouts, id, from, to) => workouts.filter(w => w.member_id === id && w.day >= from && w.day <= to).reduce((s, w) => s + w.minutes * (w.intensity === 'vigorous' ? 2 : 1), 0);
+// Active minutes = workouts (vigorous ×2, WHO) + brisk walking estimated from steps:
+// every 100 steps above a 4,000/day baseline ≈ 1 minute (~100 steps/min = moderate pace).
+// Logged Walk/Run minutes are subtracted from the step part so they aren't counted twice.
+const STEP_BASE = 4000, STEPS_PER_MIN = 100;
+function dayActive(checkins, workouts, id, d) {
+  const ws = workouts.filter(w => w.member_id === id && w.day === d);
+  const wMin = ws.reduce((s, w) => s + w.minutes * (w.intensity === 'vigorous' ? 2 : 1), 0);
+  const walked = ws.filter(w => w.kind === 'Walk' || w.kind === 'Run').reduce((s, w) => s + w.minutes, 0);
+  const steps = checkins.find(c => c.member_id === id && c.day === d)?.steps;
+  const sMin = steps != null ? Math.max(0, Math.round((steps - STEP_BASE) / STEPS_PER_MIN) - walked) : 0;
+  return { wMin, sMin, total: wMin + sMin, steps, has: steps != null || ws.length > 0 };
+}
+function activeMin(checkins, workouts, id, from, to) {
+  let t = 0; for (let d = from; d <= to; d = addDays(d, 1)) t += dayActive(checkins, workouts, id, d).total; return t;
+}
+function activeSplit(checkins, workouts, id, from, to) {
+  let w = 0, s = 0, has = false; for (let d = from; d <= to; d = addDays(d, 1)) { const x = dayActive(checkins, workouts, id, d); w += x.wMin; s += x.sMin; has = has || x.has; } return { w, s, has };
+}
 
 function computeAlerts(members, checkins, workouts, today) {
   const out = [];
@@ -361,13 +378,9 @@ function computeAlerts(members, checkins, workouts, today) {
       if (recent.every(w => Math.abs(w - usual) > 60)) out.push({ level: 'amber', icon: 'sunrise', text: `${m.name}'s wake-up time has shifted: usually ${fmtMin(usual)}, lately around ${fmtMin(avg(recent))}. The rhythm is drifting.` });
     }
 
-    const st = [1, 2, 3].map(i => by[addDays(today, -i)]?.steps).filter(v => v != null);
-    if (st.length === 3 && avg(st) < Number(m.steps_target) * 0.5) out.push({ level: 'soft', icon: 'steps', text: `${m.name} has been moving little: ${num(Math.round(avg(st)))} steps a day over the last 3 days.` });
-
-    const usesWorkouts = workouts.some(w => w.member_id === m.id);
-    const wk = activeMin(workouts, m.id, addDays(today, -6), today);
-    const at = Number(m.activity_target || 150);
-    if (usesWorkouts && wk < at * 0.5) out.push({ level: 'soft', icon: 'activity', text: `${m.name}: ${wk} of ${at} active minutes in the last 7 days.` });
+    const sp = activeSplit(checkins, workouts, m.id, addDays(today, -6), today);
+    const wk = sp.w + sp.s, at = Number(m.activity_target || 150);
+    if (sp.has && wk < at * 0.5) out.push({ level: 'soft', icon: 'activity', text: `${m.name}: ${wk} of ${at} active minutes in the last 7 days.` });
 
     const fd = [0, 1, 2].map(i => by[addDays(today, -i)]?.food_prev).filter(Boolean);
     if (fd.length === 3 && fd.every(f => f === 'bad')) out.push({ level: 'soft', icon: 'food', text: `${m.name} has rated food as poor 3 days in a row.` });
@@ -386,9 +399,9 @@ function scores(m, checkins, workouts, today) {
   const wk = last(0, 6).map(c => toMin(c?.wake_time)).filter(v => v != null);
   const bd = last(0, 6).map(c => bedMin(c?.bed_time)).filter(v => v != null);
   const fd = last(0, 6).map(c => c?.food_prev).filter(Boolean).map(f => ({ good: 1, meh: 0.5, bad: 0 })[f]);
-  const act = activeMin(workouts, m.id, addDays(today, -6), today);
-  const usesWorkouts = workouts.some(w => w.member_id === m.id);
-  const sport = [st.length ? Math.min(1, avg(st) / Number(m.steps_target)) : null, usesWorkouts ? Math.min(1, act / Number(m.activity_target || 150)) : null].filter(v => v != null);
+  const sp = activeSplit(checkins, workouts, m.id, addDays(today, -6), today);
+  const act = sp.w + sp.s;
+  const sport = sp.has ? [Math.min(1, act / Number(m.activity_target || 150))] : [];
   return {
     sleep: sl.length ? Math.max(0.05, Math.min(1, (avg(sl) - 5) / (Number(m.sleep_target) - 5))) : null,
     sport: sport.length ? avg(sport) : null,
@@ -661,24 +674,24 @@ function Activity({ ctx }) {
   const [adding, setAdding] = useState(false); const [steps, setSteps] = useState(false);
   const row = checkins.find(c => c.member_id === me.id && c.day === today) || {};
   const todays = workouts.filter(w => w.member_id === me.id && w.day === today);
-  const wk = activeMin(workouts, me.id, addDays(today, -6), today);
-  const at = Number(me.activity_target || 150), stT = Number(me.steps_target);
+  const wk = activeMin(checkins, workouts, me.id, addDays(today, -6), today);
+  const at = Number(me.activity_target || 150);
+  const td = dayActive(checkins, workouts, me.id, today);
   const del = async w => { await sb.from('workouts').delete().eq('id', w.id); ctx.reload(); };
   return html`<div className="card">
-    <div className="card-title"><b>Activity today</b><button className="btn sm" onClick=${() => setAdding(true)}><${Icon} n="plus" s=${16} w=${2.4} />Workout</button></div>
-    <button className="row" style=${{ width: '100%', background: 'none', border: 0, padding: '10px 0 4px', textAlign: 'left' }} onClick=${() => setSteps(true)}>
-      <div className="kind buy"><${Icon} n="steps" s=${19} /></div>
-      <div className="grow"><div className="big-num">${num(row.steps ?? 0)}</div><div className="tiny muted">steps · goal ${num(stT)}</div></div>
+    <div className="card-title"><b>Active minutes</b><button className="btn sm" onClick=${() => setAdding(true)}><${Icon} n="plus" s=${16} w=${2.4} />Workout</button></div>
+    <div className="row" style=${{ alignItems: 'baseline', gap: 8, marginTop: 8 }}><span className="big-num">${td.total}</span><span className="small muted">min today</span>
+      <span className="grow"></span><span className="small"><b>${wk}</b><span className="muted"> / ${at} this week</span></span></div>
+    <div className="bar" style=${{ margin: '10px 0 4px' }}><i style=${{ width: `${Math.min(100, wk / at * 100)}%`, background: 'var(--p2)' }}></i></div>
+    <button className="row" style=${{ width: '100%', background: 'none', border: 0, padding: '12px 0 0', textAlign: 'left' }} onClick=${() => setSteps(true)}>
+      <div className="kind buy"><${Icon} n="steps" s=${18} /></div>
+      <div className="grow"><div className="t">${num(row.steps ?? 0)} steps</div><div className="tiny muted">≈ ${td.sMin} active min from walking</div></div>
       <${Icon} n="pencil" s=${16} style=${{ color: 'var(--muted)' }} />
     </button>
-    <div className="bar" style=${{ margin: '8px 0 4px' }}><i style=${{ width: `${Math.min(100, (row.steps || 0) / stT * 100)}%` }}></i></div>
     ${todays.map(w => html`<div key=${w.id} className="row" style=${{ padding: '10px 0 0' }}>
       <div className="kind do"><${Icon} n="activity" s=${18} /></div>
-      <div className="grow"><div className="t">${w.kind}</div><div className="tiny muted">${w.minutes} min · ${w.intensity}</div></div>
+      <div className="grow"><div className="t">${w.kind}</div><div className="tiny muted">${w.minutes} min · ${w.intensity}${w.intensity === 'vigorous' ? ` (counts ${w.minutes * 2})` : ''}</div></div>
       <button className="x" aria-label="Delete" onClick=${() => del(w)}><${Icon} n="trash" s=${17} /></button></div>`)}
-    <div className="row between small" style=${{ marginTop: 14 }}>
-      <span className="muted">Last 7 days</span><b>${wk} / ${at} active min</b></div>
-    <div className="bar" style=${{ marginTop: 6 }}><i style=${{ width: `${Math.min(100, wk / at * 100)}%`, background: 'var(--p2)' }}></i></div>
     ${adding && html`<${AddWorkout} ctx=${ctx} close=${() => setAdding(false)} />`}
     ${steps && html`<${EditSteps} ctx=${ctx} day=${today} value=${row.steps} close=${() => setSteps(false)} />`}
   </div>`;
@@ -937,12 +950,22 @@ function MoveSection({ ctx, m, mine }) {
   return html`<div>
     <div className="card">
       <div className="card-title"><b>Move this week</b><${LvPill} lv=${p.level} label=${p.label} /></div>
-      <div className="row between small" style=${{ marginTop: 12 }}><span className="muted">Active minutes (vigorous ×2)</span><b>${p.act} / ${p.at}</b></div>
-      <div className="bar" style=${{ marginTop: 6 }}><i style=${{ width: `${Math.min(100, p.act / p.at * 100)}%`, background: 'var(--p2)' }}></i></div>
-      <div className="small muted" style=${{ marginTop: 16, fontWeight: 600 }}>Steps · goal ${num(p.stT)}</div>
-      <${Bars} goal=${p.stT} max=${Math.max(p.stT * 1.5, ...days7.map(d => by[d]?.steps || 0))} items=${days7.map(d => { const v = by[d]?.steps; return { key: d, label: DOW[dow(d)].slice(0, 2), value: v ?? null,
-        color: v == null ? '' : v >= p.stT ? 'var(--good)' : v >= p.stT * 0.6 ? 'var(--warn)' : 'var(--bad)' }; })} />
-      <p className="tiny muted" style=${{ marginBottom: mine ? 12 : 0 }}>WHO: 150–300 active minutes a week. Steps: most of the benefit comes by ~7,000–8,000 a day.</p>
+      <div className="row" style=${{ alignItems: 'baseline', gap: 6, marginTop: 10 }}><span className="big-num">${p.act}</span><span className="small muted">/ ${p.at} active min · last 7 days</span></div>
+      <div className="bar" style=${{ marginTop: 10, display: 'flex' }}>
+        <i style=${{ width: `${Math.min(100, p.fromSteps / p.at * 100)}%`, background: 'var(--accent)', borderRadius: 0 }}></i>
+        <i style=${{ width: `${Math.min(100 - Math.min(100, p.fromSteps / p.at * 100), p.fromWorkouts / p.at * 100)}%`, background: 'var(--p2)', borderRadius: 0 }}></i></div>
+      <div className="row small" style=${{ gap: 14, marginTop: 8, flexWrap: 'wrap' }}>
+        <span className="row" style=${{ gap: 6 }}><i style=${{ width: 9, height: 9, borderRadius: 9, background: 'var(--accent)' }}></i>${p.fromSteps} from walking</span>
+        <span className="row" style=${{ gap: 6 }}><i style=${{ width: 9, height: 9, borderRadius: 9, background: 'var(--p2)' }}></i>${p.fromWorkouts} from workouts</span></div>
+      <div className="small muted" style=${{ marginTop: 16, fontWeight: 600 }}>Per day · dashed = ${Math.round(p.at / 7)} min/day pace</div>
+      <${Bars} goal=${p.at / 7} max=${Math.max(p.at / 7 * 2, ...days7.map(d => dayActive(ctx.checkins, ctx.workouts, m.id, d).total))} items=${days7.map(d => { const x = dayActive(ctx.checkins, ctx.workouts, m.id, d); return { key: d, label: DOW[dow(d)].slice(0, 2), value: x.has ? x.total : null,
+        color: x.total >= p.at / 7 ? 'var(--good)' : x.total >= p.at / 14 ? 'var(--warn)' : 'var(--bad)' }; })} />
+      <details style=${{ marginBottom: mine ? 12 : 0 }}><summary className="link" style=${{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><${Icon} n="info" s=${14} />How it's counted</summary>
+        <div className="guide">WHO recommends 150–300 active minutes a week. Famly counts:
+          <ul><li><b>Walking:</b> every 100 steps above 4,000 a day ≈ 1 minute. The first 4,000 is normal daily moving; ~100 steps a minute is a brisk pace.</li>
+          <li><b>Workouts:</b> minutes you log. Vigorous counts double (WHO).</li>
+          <li>Logged walks and runs aren't counted twice.</li></ul>
+          It's an estimate: iPhone only sends total steps, not how fast you walked.</div></details>
       ${mine && html`<button className="btn" onClick=${() => setAdding(true)}><${Icon} n="plus" s=${18} w=${2.4} />Log workout</button>`}
     </div>
     <${Sec} title="Last 14 days" />
@@ -951,7 +974,8 @@ function MoveSection({ ctx, m, mine }) {
         return html`<div key=${d} className="hist" style=${{ alignItems: 'flex-start' }}>
           <div className="d">${DOW[dow(d)]}<small>${fmtShort(d)}</small></div>
           <div className="grow small">
-            <button disabled=${!mine} onClick=${() => setSteps(d)} style=${{ background: 'none', border: 0, padding: 0, fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <div style=${{ fontWeight: 700, marginBottom: 3 }}>${(() => { const x = dayActive(ctx.checkins, ctx.workouts, m.id, d); return x.has ? `${x.total} active min` : html`<span className="muted">–</span>`; })()}</div>
+            <button disabled=${!mine} onClick=${() => setSteps(d)} style=${{ background: 'none', border: 0, padding: 0, color: 'inherit', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
               <${Icon} n="steps" s=${14} />${c.steps != null ? num(c.steps) + ' steps' : html`<span className="muted">no steps</span>`}${mine && html`<${Icon} n="pencil" s=${12} style=${{ color: 'var(--muted)' }} />`}</button>
             ${ws.map(w => html`<div key=${w.id} className="row" style=${{ gap: 6, marginTop: 4 }}><${Icon} n="activity" s=${14} />
               <span>${w.kind} · ${w.minutes} min${w.intensity === 'vigorous' ? ' · vigorous' : ''}</span>
@@ -1044,15 +1068,14 @@ function Settings({ ctx, close }) {
   const [by, setBy] = useState(me.birth_year ? String(me.birth_year) : '');
   const [sleep, setSleep] = useState(String(me.sleep_target));
   const [act, setAct] = useState(String(me.activity_target ?? 150));
-  const [steps, setSteps] = useState(String(me.steps_target));
   const [copied, setCopied] = useState(false);
   const age = by && by.length === 4 ? new Date().getFullYear() - parseInt(by) : null;
   const rec = recommend(age != null && age > 0 && age < 110 ? age : null);
-  const apply = () => { setSleep(String(rec.sleep.target)); setAct(String(rec.act.target)); setSteps(String(rec.steps.target)); };
+  const apply = () => { setSleep(String(rec.sleep.target)); setAct(String(rec.act.target)); };
   const save = async () => {
     const { error } = await sb.from('members').update({
       name: (names[me.id] || '').trim() || me.name, birth_year: by ? parseInt(by) : null,
-      sleep_target: Number(sleep) || 7.5, activity_target: parseInt(act) || 150, steps_target: parseInt(steps) || 8000,
+      sleep_target: Number(sleep) || 7.5, activity_target: parseInt(act) || 150,
     }).eq('id', me.id);
     if (error) return alert(error.message);
     for (const m of ctx.members) {
@@ -1079,8 +1102,8 @@ function Settings({ ctx, close }) {
         <div className="src" style=${{ marginTop: 4 }}>A regular wake-up time matters as much as hours slept.</div></div>
       <div className="rec"><b><${Icon} n="activity" s=${17} />${rec.act.range}</b>
         <div className="src" style=${{ marginTop: 4 }}>${rec.act.extra} Vigorous minutes count double.</div></div>
-      <div className="rec"><b><${Icon} n="steps" s=${17} />Steps ${rec.steps.range}</b>
-        <div className="src" style=${{ marginTop: 4 }}>Benefits rise up to about this range, then level off. ~7,000 already brings most of the gain.</div></div>
+      <div className="rec"><b><${Icon} n="steps" s=${17} />Walking counts too</b>
+        <div className="src" style=${{ marginTop: 4 }}>Steps are turned into active minutes. Research: most of the benefit comes by ~${rec.steps.range.replace(' a day', '')} steps a day.</div></div>
       <button className="btn ghost" onClick=${apply}>Use recommended goals</button>`
     : html`<div className="rec small muted">Add your birth year to see goals based on WHO guidelines and sleep research.</div>`}
 
@@ -1089,8 +1112,6 @@ function Settings({ ctx, close }) {
       <div className="grow"><div className="tiny muted" style=${{ marginBottom: 4 }}>Sleep (hours)</div><input type="number" step="0.5" inputMode="decimal" value=${sleep} onChange=${e => setSleep(e.target.value)} /></div>
       <div className="grow"><div className="tiny muted" style=${{ marginBottom: 4 }}>Active min/week</div><input type="number" inputMode="numeric" value=${act} onChange=${e => setAct(e.target.value)} /></div>
     </div>
-    <div className="tiny muted" style=${{ margin: '10px 0 4px' }}>Steps per day</div>
-    <input type="number" inputMode="numeric" value=${steps} onChange=${e => setSteps(e.target.value)} />
     <div style=${{ height: 16 }}></div>
     <button className="btn" onClick=${save}>Save</button>
 
