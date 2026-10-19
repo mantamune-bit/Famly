@@ -273,10 +273,34 @@ const SOURCES = [
   ['Hirshkowitz et al. (2015) National Sleep Foundation sleep duration recommendations, Sleep Health', 'https://doi.org/10.1016/j.sleh.2014.12.010'],
   ['Watson et al. (2015) AASM/SRS: adults need 7+ hours, J Clin Sleep Med', 'https://doi.org/10.5664/jcsm.4758'],
   ['Windred et al. (2024) Sleep regularity predicts mortality more strongly than duration, SLEEP', 'https://www.ukbiobank.ac.uk/publications/sleep-regularity-is-a-stronger-predictor-of-mortality-risk-than-sleep-duration-a-prospective-cohort-study/'],
+  ['Van Dongen et al. (2003) Cumulative cost of chronic sleep restriction, SLEEP', 'https://doi.org/10.1093/sleep/26.2.117'],
+  ['Prather et al. (2015) Short sleep and susceptibility to the common cold, SLEEP', 'https://doi.org/10.5665/sleep.4968'],
   ['Paluch et al. (2022) Daily steps and mortality, Lancet Public Health', 'https://hospitalhealthcare.com/specialisms/cardiovascular/mortality-benefit-from-higher-daily-steps-plateaus/'],
   ['Ding et al. (2025) Daily steps and health outcomes, Lancet Public Health', 'https://pubmed.ncbi.nlm.nih.gov/40713949/'],
   ['WHO Healthy diet fact sheet', 'https://www.who.int/news-room/fact-sheets/detail/healthy-diet'],
 ];
+
+// ---------- sleep debt ----------
+// Short night = under max(7h, goal − 30 min). AASM/SRS: adults need 7+ h.
+// Heads-up after 2 short nights in a row; warning when 3+ short nights in 7,
+// 2+ nights of ≤6 h, or ≥5 h total debt. (Van Dongen 2003: deficits build night
+// after night while you stop feeling it; Prather 2015: ≤6 h → 4.2× more colds.)
+function sleepStatus(m, checkins, today) {
+  const by = byDay(checkins, m.id);
+  const target = Number(m.sleep_target) || 7.5, shortBelow = Math.max(7, target - 0.5);
+  const nights = [...Array(7)].map((_, i) => { const d = addDays(today, -i); const v = by[d]?.sleep_hours; return { day: d, h: v == null ? null : Number(v) }; });
+  const isShort = n => n.h != null && n.h < shortBelow;
+  let streak = 0;
+  for (let i = 0; i < 7; i++) { const n = nights[i]; if (n.h == null) { if (i === 0) continue; break; } if (isShort(n)) streak++; else break; }
+  const known = nights.filter(n => n.h != null);
+  const shortCount = known.filter(isShort).length, veryShort = known.filter(n => n.h <= 6).length;
+  const debt = known.reduce((x, n) => x + Math.max(0, target - n.h), 0);
+  const level = (streak >= 3 || shortCount >= 3 || debt >= 5 || veryShort >= 2) ? 2 : streak >= 2 ? 1 : 0;
+  const wakes = []; for (let i = 0; i < 14; i++) { const w = toMin(by[addDays(today, -i)]?.wake_time); if (w != null) wakes.push(w); }
+  const wake = median(wakes) ?? 360;
+  const bedBy = fmtMin(wake - (target + (level === 2 ? 0.5 : 0)) * 60 - 15);
+  return { target, shortBelow, nights: nights.reverse(), streak, shortCount, veryShort, debt, level, bedBy, known: known.length };
+}
 
 // ---------- health logic ----------
 const byDay = (rows, id) => Object.fromEntries(rows.filter(c => c.member_id === id).map(c => [c.day, c]));
@@ -286,11 +310,11 @@ function computeAlerts(members, checkins, workouts, today) {
   const out = [];
   for (const m of members) {
     const by = byDay(checkins, m.id);
-    const target = Number(m.sleep_target);
     if (by[today]?.feeling === 'sick') out.push({ level: 'red', icon: 'thermo', text: `${m.name} isn't feeling well today. Go easy and get extra rest.` });
 
-    const sl = [0, 1, 2].map(i => by[addDays(today, -i)]?.sleep_hours).filter(v => v != null).map(Number);
-    if (sl.length === 3 && avg(sl) < target) out.push({ level: 'amber', icon: 'bed', text: `${m.name} has averaged ${hrs(avg(sl))} of sleep over the last 3 nights (goal ${hrs(target)}). Aim for an earlier night.` });
+    const ss = sleepStatus(m, checkins, today);
+    if (ss.level === 2) out.push({ level: 'red', icon: 'bed', text: `${m.name} is building up sleep debt: ${ss.shortCount} short night${ss.shortCount === 1 ? '' : 's'} this week, ${hrs(ss.debt)} below goal. In bed by ${ss.bedBy} tonight, and keep it up for a few nights.` });
+    else if (ss.level === 1) out.push({ level: 'amber', icon: 'bed', text: `${m.name} slept under ${hrs(ss.shortBelow)} two nights in a row. Aim to be in bed by ${ss.bedBy} tonight.` });
 
     const late = [0, 1, 2].map(i => bedMin(by[addDays(today, -i)]?.bed_time)).filter(v => v != null);
     if (late.length === 3 && late.every(b => b >= 1440 + 30)) out.push({ level: 'amber', icon: 'moon', text: `${m.name} has gone to bed after 00:30 three nights in a row.` });
@@ -409,26 +433,31 @@ function PickMe({ members, onPick }) {
 }
 
 // ---------- check-in ----------
-const BEDS = ['21:30', '22:00', '22:30', '23:00', '23:30', '00:00', '00:30', '01:00'];
+function SleepVerdict({ h, target }) {
+  if (h == null) return null;
+  const short = target - h;
+  return html`<div className=${'alert ' + (short > 0.25 ? (h <= 6 ? 'red' : 'amber') : 'ok')} style=${{ marginTop: 10, marginBottom: 0 }}>
+    <${Icon} n=${short > 0.25 ? 'alert' : 'check'} s=${18} />
+    <span><b>${hrs(h)} of sleep.</b> ${short > 0.25 ? `${hrs(short)} short of your ${hrs(target)} goal.` : `You hit your ${hrs(target)} goal.`}</span></div>`;
+}
 
 function FoodPicker({ value, onPick }) {
+  const [info, setInfo] = useState(false);
   return html`<div>
-    ${Object.entries(FOOD).map(([k, [ic, label, desc]]) => html`<button key=${k} className=${'opt' + (value === k ? ' on' : '')} onClick=${() => onPick(k)}>
-      <b><${Icon} n=${ic} s=${18} />${label}</b><span>${desc}</span></button>`)}
-    <details>
-      <summary className="link" style=${{ display: 'inline-flex', alignItems: 'center', gap: 4 }}><${Icon} n="info" s=${14} />What counts as eating well?</summary>
-      <div className="guide">
-        <b>Daily guide (Kemenkes & WHO)</b>
-        <ul>
-          <li><b>Sugar</b> max 50 g ≈ 4 tablespoons. Watch sweet tea, boba, kopi susu.</li>
-          <li><b>Salt</b> max 5 g ≈ 1 teaspoon. Instant noodles, kerupuk and sauces add up fast.</li>
-          <li><b>Fat</b> max 67 g ≈ 5 tablespoons of oil. Fried food is the big one.</li>
-          <li><b>Isi Piringku:</b> half the plate vegetables & fruit, the other half staple carbs and protein.</li>
-          <li><b>Veg & fruit</b> at least 400 g a day (WHO), about 5 portions.</li>
-          <li>Water 8 glasses; avoid a heavy meal within 2–3 hours of bed.</li>
-        </ul>
-      </div>
-    </details>
+    <div className="row" style=${{ gap: 8, alignItems: 'flex-start' }}>
+      <div className="grow"><${Chips} options=${Object.entries(FOOD).map(([k, [ic, l]]) => [k, l, ic])} value=${value} onPick=${onPick} /></div>
+      <button className="icon-btn" style=${{ width: 38, height: 38, color: info ? 'var(--accent)' : 'var(--muted)' }} aria-label="What counts?" onClick=${() => setInfo(!info)}><${Icon} n="info" s=${18} /></button>
+    </div>
+    ${info && html`<div className="guide">
+      ${Object.entries(FOOD).map(([k, [ic, l, d]]) => html`<div key=${k} style=${{ marginBottom: 6 }}><b>${l}:</b> ${d}</div>`)}
+      <div style=${{ marginTop: 8 }}><b>Daily limits (Kemenkes & WHO)</b></div>
+      <ul>
+        <li>Sugar max 50 g ≈ 4 tbsp (sweet tea, boba, kopi susu add up)</li>
+        <li>Salt max 5 g ≈ 1 tsp (instant noodles, kerupuk, sauces)</li>
+        <li>Oil/fat max 67 g ≈ 5 tbsp (fried food is the big one)</li>
+        <li>Isi Piringku: half the plate veg & fruit</li>
+      </ul>
+    </div>`}
   </div>`;
 }
 
@@ -458,7 +487,7 @@ function CheckIn({ ctx }) {
     <div className="card-title"><b>Check-in · ${fmtDay(today)}</b><span className="pill good"><${Icon} n="check" s=${13} w=${2.6} />Done</span></div>
     <div className="sumline">
       <span className="pill"><${Icon} n="bed" s=${14} />${t5(local.bed_time)} → ${t5(local.wake_time)}</span>
-      <span className="pill"><${Icon} n="clock" s=${14} />${hrs(Number(local.sleep_hours))}</span>
+      <span className=${'pill ' + (Number(local.sleep_hours) < (Number(me.sleep_target) || 7.5) - 0.25 ? 'warn' : 'good')}><${Icon} n="clock" s=${14} />${hrs(Number(local.sleep_hours))}</span>
       <span className="pill"><${Icon} n=${FEEL[local.feeling][0]} s=${14} />${FEEL[local.feeling][1]}</span>
       <span className="pill"><${Icon} n="food" s=${14} />Food ${FOOD[local.food_prev][1].toLowerCase()}</span>
     </div>
@@ -473,18 +502,49 @@ function CheckIn({ ctx }) {
              <button className="btn big" onClick=${() => save({ wake_time: nowHM() })}><${Icon} n="sunrise" s=${22} />I'm up</button>`
       : html`<div className="q"><${Icon} n="sunrise" s=${17} />Woke up at</div>
              <input type="time" value=${t5(local.wake_time)} onChange=${e => e.target.value && save({ wake_time: e.target.value })} />`}
-    <div className="q"><${Icon} n="bed" s=${17} />Went to sleep last night at</div>
-    <${Chips} options=${BEDS.map(b => [b, b])} value=${t5(local.bed_time)} onPick=${v => save({ bed_time: v })} />
-    <div className="row" style=${{ marginTop: 8 }}>
-      <span className="small muted" style=${{ flex: 'none' }}>Other time</span>
-      <input type="time" value=${t5(local.bed_time)} onChange=${e => e.target.value && save({ bed_time: e.target.value })} />
-    </div>
-    ${sh != null && html`<div className="small" style=${{ marginTop: 8, fontWeight: 600 }}>≈ ${hrs(sh)} of sleep</div>`}
-    <div className="q"><${Icon} n="smile" s=${17} />How do you feel today?</div>
+    <div className="q"><${Icon} n="bed" s=${17} />Fell asleep last night at</div>
+    <input type="time" value=${t5(local.bed_time)} onChange=${e => e.target.value && save({ bed_time: e.target.value })} />
+    <${SleepVerdict} h=${sh} target=${Number(me.sleep_target) || 7.5} />
+    <div className="q"><${Icon} n="smile" s=${17} />How did you feel when you woke up?</div>
     <${Chips} options=${Object.entries(FEEL).map(([k, [ic, l]]) => [k, l, ic])} value=${local.feeling} onPick=${v => save({ feeling: v })} />
     <div className="q"><${Icon} n="food" s=${17} />How did you eat yesterday?</div>
     <${FoodPicker} value=${local.food_prev} onPick=${v => save({ food_prev: v })} />
     ${partnerLine}</div>`;
+}
+
+// ---------- sleep card ----------
+function SleepCard({ ctx, m, title }) {
+  const st = sleepStatus(m, ctx.checkins, ctx.today);
+  const [why, setWhy] = useState(false);
+  const max = 10, H = 84;
+  return html`<div className="card">
+    <div className="card-title"><b>${title || 'Sleep this week'}</b>
+      <span className=${'pill ' + (st.level === 2 ? 'bad' : st.level === 1 ? 'warn' : 'good')}>${st.level === 2 ? 'Sleep debt' : st.level === 1 ? 'Watch out' : 'On track'}</span></div>
+    <div style=${{ position: 'relative', height: H + 22, marginTop: 10 }}>
+      <div style=${{ position: 'absolute', left: 0, right: 0, bottom: 22 + H * st.target / max, borderTop: '1.5px dashed var(--muted)', opacity: .5 }}></div>
+      <div style=${{ display: 'flex', gap: 8, alignItems: 'flex-end', height: '100%' }}>
+        ${st.nights.map(n => html`<div key=${n.day} style=${{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+          <div style=${{ width: '100%', maxWidth: 30, height: n.h != null ? Math.max(4, H * Math.min(n.h, max) / max) : 4, borderRadius: 7,
+            background: n.h == null ? 'var(--surface2)' : n.h <= 6 ? 'var(--bad)' : n.h < st.shortBelow ? 'var(--warn)' : 'var(--good)' }}></div>
+          <span className="tiny muted" style=${{ fontWeight: 600 }}>${DOW[dow(n.day)].slice(0, 2)}</span></div>`)}
+      </div>
+    </div>
+    <div className="stats" style=${{ marginTop: 12 }}>
+      <div className="stat"><b>${st.shortCount}/${st.known || 0}</b><span>short nights</span></div>
+      <div className="stat"><b>${hrs(st.debt)}</b><span>sleep debt</span></div>
+      <div className="stat"><b>${st.bedBy}</b><span>in bed by</span></div>
+    </div>
+    <button className="link" style=${{ marginTop: 8, display: 'inline-flex', alignItems: 'center', gap: 4 }} onClick=${() => setWhy(!why)}><${Icon} n="info" s=${14} />How this works</button>
+    ${why && html`<div className="guide">
+      A night counts as <b>short</b> under ${hrs(st.shortBelow)}. Dashed line = your ${hrs(st.target)} goal.<br />
+      <b>Heads-up</b> after 2 short nights in a row. <b>Sleep debt</b> warning after 3 short nights in a week, 2 nights of 6 h or less, or 5 h total below goal.
+      <ul>
+        <li>Two weeks of 6-hour nights impair focus as much as a full night without sleep, and people stop noticing it (Van Dongen 2003).</li>
+        <li>Sleeping 6 h or less makes you about 4× more likely to catch a cold (Prather 2015).</li>
+        <li>"In bed by" = your usual wake-up time minus your goal and 15 min to fall asleep${st.level === 2 ? ', plus 30 min extra to pay back debt' : ''}.</li>
+      </ul>
+    </div>`}
+  </div>`;
 }
 
 // ---------- activity ----------
@@ -749,8 +809,8 @@ function EditDay({ ctx, member, day, close }) {
       <div className="grow"><div className="q" style=${{ marginTop: 8 }}><${Icon} n="bed" s=${16} />Slept at</div><input type="time" value=${f.bed_time} onChange=${e => set({ bed_time: e.target.value })} /></div>
       <div className="grow"><div className="q" style=${{ marginTop: 8 }}><${Icon} n="sunrise" s=${16} />Woke at</div><input type="time" value=${f.wake_time} onChange=${e => set({ wake_time: e.target.value })} /></div>
     </div>
-    ${sh != null && html`<div className="small" style=${{ marginTop: 8, fontWeight: 600 }}>≈ ${hrs(sh)} of sleep</div>`}
-    <div className="q">Feeling</div>
+    <${SleepVerdict} h=${sh} target=${Number(member.sleep_target) || 7.5} />
+    <div className="q">Feeling on waking</div>
     <${Chips} options=${Object.entries(FEEL).map(([k, [ic, l]]) => [k, l, ic])} value=${f.feeling} onPick=${v => set({ feeling: v })} />
     <div className="q">Food (day before)</div>
     <${Chips} options=${Object.entries(FOOD).map(([k, [ic, l]]) => [k, l, ic])} value=${f.food_prev} onPick=${v => set({ food_prev: v })} />
@@ -787,6 +847,8 @@ function Health({ ctx }) {
         <div className="stat"><b>${s.act}</b><span>active min</span></div>
         <div className="stat"><b>${s.food != null ? Math.round(s.food * 100) + '%' : '–'}</b><span>good food</span></div>
       </div></div>`)}
+    <${Sec} title="Sleep" />
+    ${members.map(m => html`<${SleepCard} key=${m.id} ctx=${ctx} m=${m} title=${m.name} />`)}
     ${insights.length > 0 && html`<${Sec} title="Sick pattern" />${insights.map((t, i) => html`<div key=${i} className="alert soft"><${Icon} n="sparkle" s=${17} />${t}</div>`)}`}
     <${Sec} title="Last 14 days" />
     ${members.length > 1 && html`<${Seg} options=${members.map(m => [m.id, m.name])} value=${who} onPick=${setWho} />`}
@@ -884,6 +946,7 @@ function Home({ ctx, go }) {
   return html`<div>
     <${Header} ctx=${ctx} logo=${true} title=${`${greet}, ${me.name}`} sub=${fmtLong(today)} />
     <${CheckIn} ctx=${ctx} />
+    <${SleepCard} ctx=${ctx} m=${me} />
     <${Sec} title="Heads-up" />
     ${alerts.length ? alerts.map((a, i) => html`<div key=${i} className=${'alert ' + a.level}><${Icon} n=${a.icon} s=${18} /><span>${a.text}</span></div>`)
       : html`<div className="alert ok"><${Icon} n="leaf" s=${18} /><span>All good. No warning signs right now.</span></div>`}
